@@ -10,58 +10,68 @@ import multiprocessing
 import urllib.request
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, error
+import time
 
 # **************PLEASE READ THE README.md FOR USE INSTRUCTIONS**************n
-def write_tracks(text_file: str, tracks: dict):
-    # This includins the name, artist, and spotify URL. Each is delimited by a comma.
-    with open(text_file, 'w+', encoding='utf-8') as file_out:
-        while True:
-            for item in tracks['items']:
-                if 'track' in item:
-                    track = item['track']
-                else:
-                    track = item
-                try:
-                    track_url = track['external_urls']['spotify']
-                    track_name = track['name']
-                    track_artist = track['artists'][0]['name']
-                    album_art_url = track['album']['images'][0]['url']
-                    csv_line = track_name + "," + track_artist + "," + track_url + "," + album_art_url + "\n"
-                    try:
-                        file_out.write(csv_line)
-                    except UnicodeEncodeError:  # Most likely caused by non-English song names
-                        print("Track named {} failed due to an encoding error. This is \
-                            most likely due to this song having a non-English name.".format(track_name))
-                except KeyError:
-                    print(u'Skipping track {0} by {1} (local only?)'.format(
-                            track['name'], track['artists'][0]['name']))
-            # 1 page = 50 results, check if there are more pages
-            if tracks['next']:
-                tracks = spotify.next(tracks)
-            else:
-                break
+def write_tracks(file, tracks):
+    # Check if tracks contains 'items' directly or if it's a different structure
+    if 'items' in tracks:
+        track_items = tracks['items']
+    else:
+        # If tracks is already a list of items
+        track_items = tracks
+    
+    for item in track_items:
+        if 'track' in item:
+            track = item['track']
+        else:
+            track = item  # In case the track data is directly available
+            
+        # Continue with the existing logic for processing tracks
+        track_name = track['name']
+        artist_name = track['artists'][0]['name']
+        
+        file.write(f"{artist_name} - {track_name}\n")
+    
+    return
 
 
 def write_playlist(username: str, playlist_id: str):
     results = spotify.user_playlist(username, playlist_id, fields='tracks,next,name')
     playlist_name = results['name']
-    text_file = u'{0}.txt'.format(playlist_name, ok='-_()[]{}')
-    print(u'Writing {0} tracks to {1}.'.format(results['tracks']['total'], text_file))
+    text_file_name = u'{0}.txt'.format(playlist_name, ok='-_()[]{}')
+    print(u'Writing {0} tracks to {1}.'.format(results['tracks']['total'], text_file_name))
     tracks = results['tracks']
-    write_tracks(text_file, tracks)
+    
+    # Open the file first, then pass the file object to write_tracks
+    with open(text_file_name, 'w', encoding='utf-8') as file:
+        write_tracks(file, tracks)
 
-    imgURLs = [];
+    imgURLs = []
     for item in tracks['items']:
-        imgURLs.append(item['track']['album']['images'][0]['url']);
+        imgURLs.append(item['track']['album']['images'][0]['url'])
     return playlist_name, imgURLs
 
 def find_and_download_songs(reference_file: str):
     TOTAL_ATTEMPTS = 10
+    DOWNLOAD_RETRIES = 3  # Number of times to retry downloads
+    
     with open(reference_file, "r", encoding='utf-8') as file:
         for line in file:
-            temp = line.split(",")
-            name, artist, album_art_url = temp[0], temp[1], temp[3]
-            text_to_search = artist + " - " + name
+            # The format from write_tracks is "artist_name - track_name"
+            # Split by the first occurrence of " - "
+            if " - " in line:
+                artist, name = line.strip().split(" - ", 1)
+            else:
+                # Skip malformed lines
+                print(f"Skipping malformed line: {line.strip()}")
+                continue
+                
+            # Getting album art URL from the tracks list
+            # Since we don't have it in the text file, we need to search for it again
+            text_to_search = f"{artist} - {name}"
+            
+            # Search for the track again to get its URL
             best_url = None
             attempts_left = TOTAL_ATTEMPTS
             while attempts_left > 0:
@@ -69,58 +79,165 @@ def find_and_download_songs(reference_file: str):
                     results_list = YoutubeSearch(text_to_search, max_results=1).to_dict()
                     best_url = "https://www.youtube.com{}".format(results_list[0]['url_suffix'])
                     break
-                except IndexError:
+                except (IndexError, KeyError) as e:
                     attempts_left -= 1
-                    print("No valid URLs found for {}, trying again ({} attempts left).".format(
-                        text_to_search, attempts_left))
+                    print("No valid URLs found for {}, trying again ({} attempts left). Error: {}".format(
+                        text_to_search, attempts_left, str(e)))
+                # Add delay between search attempts to avoid rate limiting
+                time.sleep(1)
             if best_url is None:
                 print("No valid URLs found for {}, skipping track.".format(text_to_search))
                 continue
 
-            print("Initiating download for Image {}.".format(album_art_url))
-            f = open('{}.jpg'.format(name),'wb')
-            f.write(urllib.request.urlopen(album_art_url).read())
-            f.close()
+            # Create safe filenames by replacing problematic characters
+            safe_name = name.replace('｜', '-').replace('|', '-').replace(':', '-').replace('?', '').replace('"', '')
+            # Replace any other problematic characters
+            safe_name = ''.join(c for c in safe_name if c.isprintable() and c not in '<>:"/\\|?*')
+            
+            # For album art, we'll need to use a placeholder or get it from YouTube
+            album_art_url = None
+            for attempt in range(DOWNLOAD_RETRIES):
+                try:
+                    # Download YouTube thumbnail to use as album art
+                    with yt_dlp.YoutubeDL({'quiet': True, 'socket_timeout': 30}) as ydl:
+                        info = ydl.extract_info(best_url, download=False)
+                        if 'thumbnail' in info:
+                            album_art_url = info['thumbnail']
+                            print(f"Using YouTube thumbnail as album art for {text_to_search}")
+                            break
+                        else:
+                            raise Exception("No thumbnail found")
+                except Exception as e:
+                    print(f"Error getting album art (attempt {attempt+1}/{DOWNLOAD_RETRIES}): {str(e)}")
+                    # Wait before retrying
+                    time.sleep(2 * (attempt + 1))  # Exponential backoff
+            
+            if album_art_url is None:
+                print(f"Could not get album art for {text_to_search}, skipping album art")
+                continue
+
+            try:
+                print("Initiating download for Image {}.".format(album_art_url))
+                # Use a timeout for the request
+                from urllib.error import HTTPError, URLError
+                
+                art_download_success = False
+                for attempt in range(DOWNLOAD_RETRIES):
+                    try:
+                        req = urllib.request.Request(
+                            album_art_url,
+                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as response, open('{}.jpg'.format(safe_name), 'wb') as f:
+                            f.write(response.read())
+                        art_download_success = True
+                        break
+                    except (HTTPError, URLError) as e:
+                        print(f"HTTP error downloading album art (attempt {attempt+1}/{DOWNLOAD_RETRIES}): {str(e)}")
+                        time.sleep(2 * (attempt + 1))  # Exponential backoff
+                    except Exception as e:
+                        print(f"Error downloading album art (attempt {attempt+1}/{DOWNLOAD_RETRIES}): {str(e)}")
+                        time.sleep(2 * (attempt + 1))
+                
+                if not art_download_success:
+                    print(f"Failed to download album art after {DOWNLOAD_RETRIES} attempts, skipping album art")
+                    continue
+            except Exception as e:
+                print(f"Error saving album art: {str(e)}")
+                continue
 
             # Run you-get to fetch and download the link's audio
             print("Initiating download for {}.".format(text_to_search))
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl':'%(title)s',     #name the file the ID of the video
-                'embedthumbnail': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }, {
-                    'key': 'FFmpegMetadata',
-                }]
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info([best_url][0], download=True)
+            
+            download_success = False
+            for attempt in range(DOWNLOAD_RETRIES):
+                try:
+                    ydl_opts = {
+                        'format': 'bestaudio/best',
+                        'outtmpl': '%(title)s',     #name the file the ID of the video
+                        'embedthumbnail': True,
+                        'socket_timeout': 30,  # Add timeout 
+                        'retries': 5,          # Internal retries
+                        'fragment_retries': 5, # Retry fragments
+                        'skip_unavailable_fragments': True,
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }, {
+                            'key': 'FFmpegMetadata',
+                        }]
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info_dict = ydl.extract_info([best_url][0], download=True)
+                    download_success = True
+                    break
+                except Exception as e:
+                    print(f"Download error (attempt {attempt+1}/{DOWNLOAD_RETRIES}): {str(e)}")
+                    time.sleep(5 * (attempt + 1))  # Longer backoff for main content
+            
+            if not download_success:
+                print(f"Failed to download {text_to_search} after {DOWNLOAD_RETRIES} attempts, skipping track")
+                try:
+                    # Clean up album art if we couldn't download the audio
+                    if os.path.exists(f"{safe_name}.jpg"):
+                        os.remove(f"{safe_name}.jpg")
+                except:
+                    pass
+                continue
 
-                # extract the name of the downloaded file from the info_dict
+            # extract the name of the downloaded file from the info_dict
             filename = ydl.prepare_filename(info_dict)
+            
+            # For safety, make sure the filename has a clean extension
+            if not filename.endswith('.mp3'):
+                mp3_filename = filename + '.mp3'
+            else:
+                mp3_filename = filename
+                
             print(f"The downloaded file name is: {filename}")
 
-            print('AddingCoverImage ...')
-            audio = MP3(f'{filename}' + '.mp3', ID3=ID3)
+            # Try to locate the MP3 file, checking both the original filename and our safe version
+            print('Adding Cover Image...')
+            
+            try:
+                audio = MP3(mp3_filename, ID3=ID3)
+            except Exception as e:
+                print(f"Error opening {mp3_filename}: {e}")
+                # Try to find the actual file that was created
+                import glob
+                possible_files = glob.glob(f"{os.path.splitext(filename)[0]}*.mp3")
+                if possible_files:
+                    mp3_filename = possible_files[0]
+                    print(f"Found alternative file: {mp3_filename}")
+                    audio = MP3(mp3_filename, ID3=ID3)
+                else:
+                    print(f"Could not find any MP3 file for {filename}")
+                    continue
+                
             try:
                 audio.add_tags()
             except error:
                 pass
 
-            audio.tags.add(
-                APIC(
-                    encoding=3,  # 3 is for utf-8
-                    mime="image/jpeg",  # can be image/jpeg or image/png
-                    type=3,  # 3 is for the cover image
-                    desc='Cover',
-                    data=open("{}.jpg".format(name), mode='rb').read()
+            try:
+                audio.tags.add(
+                    APIC(
+                        encoding=3,  # 3 is for utf-8
+                        mime="image/jpeg",  # can be image/jpeg or image/png
+                        type=3,  # 3 is for the cover image
+                        desc='Cover',
+                        data=open("{}.jpg".format(safe_name), mode='rb').read()
+                    )
                 )
-            )
-            audio.save()
-            os.remove("{}.jpg".format(name))
+                audio.save()
+                
+                # Only remove the jpg file if everything succeeded
+                if os.path.exists(f"{safe_name}.jpg"):
+                    os.remove("{}.jpg".format(safe_name))
+            except Exception as e:
+                print(f"Error adding cover image: {e}")
+                # Don't remove the jpg file in case of error
 
 
 
